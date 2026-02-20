@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-engine
+  labels:
+    app: inference-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-engine
+  template:
+    metadata:
+      labels:
+        app: inference-engine
+      annotations:
+        # Prometheus scrape annotations (used without Prometheus Operator)
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8080"
+        prometheus.io/path:   "/metrics"
+    spec:
+      # Give the Python worker time to load the model before the proxy starts
+      # sending requests. initContainers could also be used here.
+      terminationGracePeriodSeconds: 30
+
+      volumes:
+        # Shared emptyDir volume — exists only for the lifetime of this Pod.
+        # Both containers mount it at /tmp to share the Unix Domain Socket file.
+        - name: socket-vol
+          emptyDir: {}
+
+        # Model weights — mount from a hostPath for Minikube/local dev.
+        # Replace with a PersistentVolumeClaim in production.
+        - name: model-vol
+          hostPath:
+            path: /models          # pre-populated on the Minikube node
+            type: DirectoryOrCreate
+
+      containers:
+
+        # ── Container A: C++ Sidecar Proxy ───────────────────────────────────
+        - name: cpp-sidecar
+          image: ghcr.io/GITHUB_USERNAME/cpp-sidecar:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: inference-engine-config
+
+          volumeMounts:
+            - name: socket-vol
+              mountPath: /tmp
+
+          resources:
+            requests:
+              cpu:    "500m"
+              memory: "256Mi"
+            limits:
+              cpu:    "1"
+              memory: "512Mi"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+        # ── Container B: Python Worker ────────────────────────────────────────
+        - name: python-worker
+          image: ghcr.io/GITHUB_USERNAME/python-worker:latest
+          imagePullPolicy: Always
+
+          envFrom:
+            - configMapRef:
+                name: inference-engine-config
+
+          volumeMounts:
+            - name: socket-vol
+              mountPath: /tmp
+            - name: model-vol
+              mountPath: /models
+              readOnly: true
+
+          resources:
+            requests:
+              cpu:    "1"
+              memory: "1Gi"
+            limits:
+              cpu:    "4"
+              memory: "3Gi"
+
+          # The socket file appearing = worker is ready.
+          readinessProbe:
+            exec:
+              command: ["test", "-S", "/tmp/inference.sock"]
+            initialDelaySeconds: 30   # model loading time
+            periodSeconds: 5
+            failureThreshold: 24      # wait up to 2 minutes
+
+          livenessProbe:
+            exec:
+              command: ["test", "-S", "/tmp/inference.sock"]
+            initialDelaySeconds: 60
+            periodSeconds: 30

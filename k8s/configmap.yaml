@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-engine-config
+  labels:
+    app: inference-engine
+data:
+  # Shared between both containers via environment variables
+  SOCKET_PATH:  "/tmp/inference.sock"
+  MODEL_PATH:   "/models/tinyllama-1.1b-q4.gguf"
+  N_CTX:        "2048"
+  HTTP_PORT:    "8080"
+  NUM_WORKERS:  "4"
+  IO_THREADS:   "2"

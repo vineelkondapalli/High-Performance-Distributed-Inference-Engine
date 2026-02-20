@@ -1,0 +1,26 @@
+# Model weights — too large for git (download via scripts/download_model.sh)
+models/
+
+# C++ build artifacts
+cpp-sidecar/build/
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Locust results
+load-testing/results/
+
+# Benchmark output
+benchmark_results.png
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp

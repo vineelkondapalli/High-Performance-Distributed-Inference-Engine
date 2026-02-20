@@ -1,0 +1,61 @@
+version: "3.9"
+
+# Local development / integration testing environment.
+# Mirrors the Kubernetes sidecar pattern using a named volume for the UDS file.
+#
+# Usage:
+#   docker compose up --build          # build images and start
+#   docker compose up -d               # start in background
+#   docker compose logs -f             # tail logs
+#   docker compose down                # stop and remove containers
+
+services:
+
+  # ── Python Worker (starts first; C++ proxy waits for socket) ──────────────
+  python-worker:
+    build:
+      context: ./python-worker
+      dockerfile: Dockerfile
+    volumes:
+      - socket-vol:/tmp          # shared UDS socket
+      - ./models:/models:ro      # GGUF model files (read-only)
+    environment:
+      SOCKET_PATH: /tmp/inference.sock
+      MODEL_PATH:  /models/tinyllama-1.1b-q4.gguf
+      N_CTX:       "2048"
+    restart: unless-stopped
+    healthcheck:
+      # Socket file existence = worker is ready
+      test: ["CMD", "test", "-S", "/tmp/inference.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 60s   # model loading can take ~30–60s on CPU
+
+  # ── C++ Sidecar Proxy ─────────────────────────────────────────────────────
+  cpp-sidecar:
+    build:
+      context: ./cpp-sidecar
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"              # HTTP ingress
+    volumes:
+      - socket-vol:/tmp          # shared UDS socket
+    environment:
+      SOCKET_PATH:  /tmp/inference.sock
+      HTTP_PORT:    "8080"
+      NUM_WORKERS:  "4"
+      IO_THREADS:   "2"
+    depends_on:
+      python-worker:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  socket-vol:
+    driver: local
