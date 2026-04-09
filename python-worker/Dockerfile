@@ -1,15 +1,18 @@
-# python:3.11-slim — small base, no heavy ML frameworks needed (llama.cpp is self-contained)
-FROM python:3.11-slim
+# CUDA 12.1 runtime — required for bitsandbytes INT4 and Triton kernels
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# Build tools needed to compile llama-cpp-python's C extension
+# Python 3.11 + libgomp (required by PyTorch OpenMP threading)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
+        python3.11 python3.11-dev python3-pip \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python3
 
 WORKDIR /app
 
-# Install Python dependencies first (layer caching)
+# Install dependencies first (layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -18,7 +21,9 @@ COPY src/ src/
 
 # Environment defaults
 ENV SOCKET_PATH=/tmp/inference.sock \
-    MODEL_PATH=/models/tinyllama-1.1b-q4.gguf \
-    N_CTX=2048
+    HF_MODEL_ID=TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    HF_HOME=/models/hf_cache \
+    N_CTX=2048 \
+    TRITON_ROPE=0
 
 CMD ["python", "src/worker.py"]

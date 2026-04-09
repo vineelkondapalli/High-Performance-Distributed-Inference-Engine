@@ -1,3 +1,9 @@
-# LLM inference backend — CPU build
-# For GPU support: CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install llama-cpp-python
-llama-cpp-python>=0.2.56
+torch==2.3.0
+torchvision==0.18.0
+torchaudio==2.3.0
+--index-url https://download.pytorch.org/whl/cu121
+
+transformers==4.40.2
+bitsandbytes>=0.43.0
+accelerate>=0.29.0
+triton>=2.3.0

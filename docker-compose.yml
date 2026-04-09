@@ -16,13 +16,23 @@ services:
     build:
       context: ./python-worker
       dockerfile: Dockerfile
+    runtime: nvidia                    # NVIDIA Container Toolkit GPU access
     volumes:
-      - socket-vol:/tmp          # shared UDS socket
-      - ./models:/models:ro      # GGUF model files (read-only)
+      - socket-vol:/tmp                # shared UDS socket
+      - ./models:/models               # HF model cache needs write access
     environment:
       SOCKET_PATH: /tmp/inference.sock
-      MODEL_PATH:  /models/tinyllama-1.1b-q4.gguf
+      HF_MODEL_ID: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      HF_HOME:     /models/hf_cache
       N_CTX:       "2048"
+      TRITON_ROPE: "0"                 # set to "1" to enable fused Triton RoPE kernel
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
       # Socket file existence = worker is ready
@@ -30,7 +40,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-      start_period: 60s   # model loading can take ~30–60s on CPU
+      start_period: 120s  # first run downloads HF model (~2GB); subsequent starts are fast
 
   # ── C++ Sidecar Proxy ─────────────────────────────────────────────────────
   cpp-sidecar:
