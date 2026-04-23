@@ -1,183 +1,146 @@
 # High-Performance Distributed Inference Engine
 
-A Kubernetes-native LLM inference system using the **Sidecar Design Pattern**: a C++20 async proxy insulates a Python/llama.cpp worker from high-concurrency traffic, mirroring production architectures used by Istio and KServe.
+A C++20 async HTTP proxy paired with a Python LLM worker, connected over a Unix Domain Socket. The C++ sidecar handles all HTTP I/O, priority queuing, and Prometheus metrics — freeing the Python side to do pure inference. The worker runs TinyLlama-1.1B-Chat quantized to INT4 (NF4) via HuggingFace + bitsandbytes. Custom CUDA and Triton kernels are included and benchmarked against PyTorch baselines.
 
 ## Architecture
 
 ```
-                        ┌─────────────────────────────────────────────┐
-                        │              Kubernetes Pod                  │
-                        │                                             │
-  HTTP Clients          │  ┌─────────────────┐    Unix Domain Socket  │
-  ──────────────────►   │  │  C++ Sidecar    │ ──────────────────►   │
-  POST /infer           │  │  (Boost.Beast)  │  /tmp/inference.sock  │
-  GET  /metrics         │  │                 │ ◄──────────────────   │
-  GET  /health          │  │ • Async HTTP    │                        │
-                        │  │ • Priority Queue│  ┌─────────────────┐  │
-                        │  │ • Prometheus    │  │  Python Worker  │  │
-  Prometheus ──────────►  │  │   /metrics     │  │ (llama-cpp-py)  │  │
-                        │  └─────────────────┘  │                 │  │
-                        │                        │ TinyLlama-1.1B  │  │
-                        │                        │ 4-bit Quantized │  │
-                        │                        └─────────────────┘  │
-                        │                                             │
-                        │         Shared emptyDir Volume (/tmp)       │
-                        └─────────────────────────────────────────────┘
+  HTTP Clients                C++ Sidecar (Boost.Beast)        Python Worker
+  ─────────────►  POST /infer  ──────────────────────────►    UDS server
+  GET /metrics                 Priority Queue (max-heap)        HuggingFace
+  GET /health                  Prometheus /metrics              TinyLlama INT4
+                               UDS client                       Triton RoPE kernel
+                                      │                         CUDA RMSNorm kernel
+                                      ▼
+                            /tmp/inference.sock
 ```
 
-## Why This Architecture?
+## Key Components
 
-| Problem | Solution |
-|---------|----------|
-| Python GIL limits concurrency | C++ handles all HTTP I/O; Python does pure inference |
-| TCP overhead for intra-pod comms | Unix Domain Sockets (kernel IPC, zero network stack) |
-| Requests lost when model is busy | Thread-safe priority queue buffers up to N requests |
-| No visibility into system behavior | Prometheus metrics + Grafana dashboards |
+| Component | Details |
+|---|---|
+| **IPC transport** | Unix Domain Socket with length-prefixed JSON — bypasses TCP stack entirely |
+| **Priority queue** | Thread-safe `std::priority_queue` (max-heap); HTTP handlers push, single worker pops |
+| **CUDA RMSNorm kernel** | Hand-rolled: `float4` vectorized loads, `__shfl_down_sync` warp reduction, 2.3–4.1× faster than `torch.rms_norm` |
+| **Triton RoPE kernel** | Fuses HuggingFace's ~8-launch `apply_rotary_pos_emb` into a single Triton kernel |
+| **INT4 quantization** | NF4 via bitsandbytes — TinyLlama-1.1B fits in ~700 MB VRAM |
+| **Observability** | Prometheus metrics: request count, latency histogram, queue depth, queue wait time |
+| **CI** | GitHub Actions builds and pushes Docker images to GHCR on every push to main |
 
-## Tech Stack
+## CUDA RMSNorm Kernel
 
-| Component | Technology | Why |
-|-----------|-----------|-----|
-| Orchestration | Kubernetes (Minikube) | Cloud-native standard |
-| Proxy | C++20 + Boost.Beast/Asio | Async I/O, zero GIL |
-| Model serving | Python + llama-cpp-python | Best LLM ecosystem |
-| IPC | Unix Domain Sockets | OS-level IPC, no TCP overhead |
-| Observability | Prometheus + Grafana | Industry standard MLOps |
-| CI/CD | GitHub Actions → GHCR | Automated image builds |
-| Load testing | Locust | Realistic concurrent load |
+Hand-rolled from scratch targeting RTX 2080 Ti (sm_75). Benchmarked against `torch.nn.functional.rms_norm` with CUDA events (10 warmup + 100 measured iterations):
 
-## Quickstart (Docker Compose)
+| Shape (B, S, H)  | dtype | Kernel ms | Torch ms | Speedup | DRAM BW   | % of 616 GB/s peak |
+|------------------|-------|-----------|----------|---------|-----------|---------------------|
+| (1, 2048, 4096)  | fp32  | 0.155     | 0.434    | **2.80×** | 437 GB/s | 71%                |
+| (1, 2048, 4096)  | fp16  | 0.068     | 0.275    | **4.05×** | 501 GB/s | 81%                |
+| (4, 2048, 4096)  | fp32  | 0.633     | 1.702    | **2.69×** | 426 GB/s | 69%                |
+| (1, 4096, 8192)  | fp32  | 0.733     | 1.701    | **2.32×** | 367 GB/s | 60%                |
+| (1, 4096, 8192)  | fp16  | 0.345     | 0.909    | **2.63×** | 391 GB/s | 64%                |
 
-### Prerequisites
-- Docker Desktop (Windows/Mac/Linux)
-- 4GB+ RAM available to Docker
+Bandwidth measured via `torch.profiler` device timing. The kernel is memory-bound (arithmetic intensity ≈ 0.26 FLOP/byte vs roofline ridge at 21.8 FLOP/byte on this GPU). PyTorch's ATen path reaches only ~25% peak bandwidth because it dispatches through multiple smaller kernels with separate launch overhead.
 
-### 1. Download the model
+Source: [python-worker/src/cuda_kernels/rmsnorm_kernel.cu](python-worker/src/cuda_kernels/rmsnorm_kernel.cu)  
+Design notes: [python-worker/src/cuda_kernels/README_rmsnorm.md](python-worker/src/cuda_kernels/README_rmsnorm.md)
+
+## Running Locally (no Docker needed)
+
+**Requirements:** CUDA 12.x, PyTorch 2.5.1+cu124, conda or pip.
+
 ```bash
-bash scripts/download_model.sh
-# Downloads TinyLlama-1.1B-Chat Q4_K_M GGUF (~700MB) to ./models/
+pip install -r python-worker/requirements.txt
 ```
 
-### 2. Build and run
+**Terminal 1 — Python worker:**
 ```bash
-docker compose up --build
+cd python-worker
+CUDA_VISIBLE_DEVICES=0 HF_HOME=./models/hf_cache \
+  SOCKET_PATH=/tmp/inference.sock \
+  python src/worker.py
+# Ready when: Listening on /tmp/inference.sock  (~35s on first run)
 ```
 
-### 3. Test
+**Terminal 2 — C++ sidecar** (requires Boost, CMake 3.20+):
 ```bash
-# Inference
-curl -X POST http://localhost:8080/infer \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Explain quantum computing in one sentence.", "max_tokens": 80}'
+cd cpp-sidecar
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel $(nproc)
+SOCKET_PATH=/tmp/inference.sock HTTP_PORT=8080 ./build/proxy_server
+```
 
-# Health check
+**Test:**
+```bash
 curl http://localhost:8080/health
 
-# Prometheus metrics
+curl -s -X POST http://localhost:8080/infer \
+  -H "Content-Type: application/json" \
+  -d '{"id":"t1","prompt":"2+2=","max_tokens":10}' | python -m json.tool
+
 curl http://localhost:8080/metrics
 ```
 
-## Quickstart (Kubernetes / Minikube)
+## Running with Docker Compose
 
 ```bash
-# Start cluster
-minikube start --memory=4096 --cpus=4
+docker compose up --build
+# Requires Docker with GPU passthrough (nvidia-container-runtime or CDI)
+```
 
-# Build images into minikube's Docker daemon
-eval $(minikube docker-env)
-docker build -t cpp-sidecar:latest ./cpp-sidecar
-docker build -t python-worker:latest ./python-worker
+## Benchmarking the RMSNorm Kernel
 
-# Deploy
-kubectl apply -f k8s/
+```bash
+# Build the CUDA extension:
+cd python-worker/src/cuda_kernels
+python setup.py build_ext --inplace
 
-# Access
-kubectl port-forward svc/inference-engine 8080:8080
-
-# Deploy monitoring
-kubectl apply -f k8s/monitoring/
-kubectl port-forward svc/grafana 3000:3000  # admin/admin
+# Run benchmark from repo root:
+CUDA_VISIBLE_DEVICES=0 python scripts/benchmark_rmsnorm.py
 ```
 
 ## IPC Protocol
 
-Containers communicate over a Unix Domain Socket using **length-prefixed JSON**:
+Length-prefixed JSON over Unix Domain Socket:
 
 ```
-┌──────────────────┬──────────────────────────────────────────────────┐
-│  4 bytes (LE)    │  JSON payload                                    │
-│  payload length  │                                                  │
-└──────────────────┴──────────────────────────────────────────────────┘
+[4-byte little-endian uint32 = payload length][JSON bytes]
 ```
 
-**Request** (C++ → Python):
-```json
-{"id": "550e8400-e29b-41d4-a716-446655440000", "prompt": "Hello", "max_tokens": 128, "priority": 0}
-```
-
-**Response** (Python → C++):
-```json
-{"id": "550e8400-e29b-41d4-a716-446655440000", "text": "Hello! How can I help?", "tokens_generated": 7, "error": null}
-```
+Request: `{"id": str, "prompt": str, "max_tokens": int, "priority": int}`  
+Response: `{"id": str, "text": str, "tokens_generated": int, "error": null | str}`
 
 ## Prometheus Metrics
 
 | Metric | Type | Description |
-|--------|------|-------------|
+|---|---|---|
 | `http_requests_total` | Counter | Total HTTP requests received |
-| `inference_latency_ms` | Histogram | End-to-end inference time (buckets: 100, 500, 1000, 2000, 5000ms) |
-| `queue_depth` | Gauge | Current number of requests waiting in queue |
-| `queue_wait_ms` | Histogram | Time requests spend waiting in queue |
-
-## Load Testing
-
-```bash
-# Install locust
-pip install locust
-
-# Run load test (100 users, 10 spawn/sec)
-locust -f load-testing/locustfile.py --host=http://localhost:8080 \
-  --users 100 --spawn-rate 10 --run-time 60s --headless
-
-# Or open the Locust web UI
-locust -f load-testing/locustfile.py --host=http://localhost:8080
-# → http://localhost:8089
-```
+| `inference_latency_ms` | Histogram | End-to-end latency (buckets: 100, 500, 1000, 2000, 5000 ms) |
+| `queue_depth` | Gauge | Requests currently waiting in priority queue |
+| `queue_wait_ms` | Histogram | Time spent waiting before dispatch |
 
 ## Project Structure
 
 ```
 .
-├── cpp-sidecar/           # C++20 async HTTP proxy
-│   ├── include/           # Headers: queue, metrics, uds_client, server
-│   ├── src/               # Implementations + main
-│   ├── CMakeLists.txt     # C++20 build, Boost.Beast
-│   └── Dockerfile         # Multi-stage: gcc:13 → debian:bookworm-slim
-├── python-worker/         # Python LLM worker
-│   ├── src/worker.py      # UDS server + llama-cpp-python
-│   ├── requirements.txt
-│   └── Dockerfile
-├── k8s/                   # Kubernetes manifests
-│   ├── deployment.yaml    # Pod with sidecar + shared volume
-│   ├── service.yaml       # NodePort service
-│   ├── configmap.yaml     # Environment configuration
-│   └── monitoring/        # Prometheus + Grafana
-├── load-testing/          # Locust scenarios
-├── .github/workflows/     # CI/CD: build + push to GHCR
-├── models/                # GGUF model files (gitignored)
-├── scripts/               # download_model.sh, benchmark.py
-└── docker-compose.yml     # Local development
+├── cpp-sidecar/                    # C++20 async HTTP proxy
+│   ├── include/                    # queue.hpp, metrics, uds_client, server
+│   ├── src/                        # Implementations + main
+│   └── CMakeLists.txt
+├── python-worker/
+│   ├── src/
+│   │   ├── worker.py               # UDS server + HuggingFace inference
+│   │   ├── rope_kernel.py          # Fused Triton RoPE kernel
+│   │   └── cuda_kernels/
+│   │       ├── rmsnorm_kernel.cu   # Hand-rolled CUDA RMSNorm (← start here)
+│   │       ├── rmsnorm_binding.cpp # PyTorch C++ extension binding
+│   │       ├── setup.py            # Build: sm_75, -O3, --use_fast_math
+│   │       └── README_rmsnorm.md   # Design notes + full benchmark results
+│   └── requirements.txt
+├── scripts/
+│   ├── benchmark_rmsnorm.py        # Correctness + perf vs torch baseline
+│   ├── benchmark.py                # End-to-end latency/throughput
+│   └── profile_rmsnorm.sh          # Nsight Compute profiling script
+├── k8s/                            # Kubernetes manifests + Prometheus/Grafana
+├── load-testing/                   # Locust scenarios
+└── .github/workflows/deploy.yml    # CI: build + push to GHCR on push to main
 ```
-
-## Benchmarks
-
-Run `python scripts/benchmark.py` after a load test to generate comparison graphs.
-
-Expected results (approximate, CPU-only):
-| Setup | Throughput | p95 Latency |
-|-------|-----------|-------------|
-| Python direct (TCP) | ~1.2 req/s | ~8500ms |
-| C++ Sidecar | ~1.2 req/s | ~8200ms |
-| C++ Sidecar under burst | Queue absorbs spike | No dropped requests |
-
-> Note: Throughput is bottlenecked by model inference time (CPU). The C++ proxy's advantage shows in **queue depth management** and **zero dropped connections** under burst traffic.

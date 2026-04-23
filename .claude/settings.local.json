@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:packages.debian.org)"
+      "WebFetch(domain:packages.debian.org)",
+      "Bash(/data/vineel/conda-envs/inference-engine/bin/python -c ' *)"
     ]
   }
 }
