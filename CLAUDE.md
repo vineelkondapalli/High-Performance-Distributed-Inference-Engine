@@ -5,14 +5,16 @@ C++ HTTP proxy (Boost.Beast) + Python inference worker connected via Unix Domain
 C++ handles HTTP and queuing. Python runs the model.
 
 ## Hardware (Linux server)
-- 2x RTX 2080 Ti (22GB VRAM total)
-- Use `device_map="auto"` — accelerate splits across both GPUs
+- 10x RTX 2080 Ti (11 GB each); **GPU 8 assigned to this project** via `CUDA_VISIBLE_DEVICES=8`
+- GPU 8 has ~10.8 GB free — TinyLlama INT4 fits on a single card
+- Inside the container GPU 8 is remapped to index 0; use `device_map="cuda:0"` (not "auto")
 
 ## Stack
 - C++20, Boost.Beast + Boost.Asio, Docker-only build
-- Python: HuggingFace transformers 4.40.2 + bitsandbytes INT4 NF4 + Triton 2.3
+- Python: HuggingFace transformers 4.40.2 + bitsandbytes INT4 NF4 + Triton 3.1
 - Model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (downloaded to `./models/hf_cache`)
-- CUDA 12.1 (host driver must be >= 525)
+- CUDA 12.6 (host driver 560.35.05); PyTorch 2.5.1+cu124
+- Conda env `inference-engine` (Python 3.11) for running scripts directly on host
 
 ## IPC protocol
 Length-prefixed JSON over UDS. **Do not change this — C++ side depends on it.**
@@ -54,30 +56,61 @@ Response: `{"id", "text", "tokens_generated", "error"}`
 2. `docker compose up --build`
 3. python-worker starts first; cpp-sidecar waits for socket healthcheck
 
-## Common commands
-```bash
-# Verify GPU inside container
-docker compose run --rm python-worker python -c \
-  "import torch; print(torch.cuda.device_count(), torch.cuda.get_device_name(0))"
+## Running locally (no Docker needed)
 
-# Test inference
+**Conda env:** `/data/vineel/conda-envs/inference-engine` (Python 3.11, all deps installed)
+
+**C++ sidecar binary:** `cpp-sidecar/build/proxy_server` (pre-built, rebuild with step below)
+
+### Terminal 1 — Python worker
+```bash
+conda activate /data/vineel/conda-envs/inference-engine
+cd python-worker
+CUDA_VISIBLE_DEVICES=8 HF_HOME=/mnt/data/shared/vineel/hf_cache \
+  SOCKET_PATH=/tmp/inference.sock TRITON_ROPE=0 \
+  python src/worker.py
+# Ready when you see: Listening on /tmp/inference.sock (~35s, model already cached)
+```
+
+### Terminal 2 — C++ sidecar
+```bash
+export LD_LIBRARY_PATH="/data/vineel/conda-envs/inference-engine/lib:$LD_LIBRARY_PATH"
+SOCKET_PATH=/tmp/inference.sock HTTP_PORT=8080 NUM_WORKERS=4 IO_THREADS=2 \
+  ./cpp-sidecar/build/proxy_server
+```
+
+### Test it
+```bash
+# Health
+curl http://localhost:8080/health
+
+# Inference
 curl -s -X POST http://localhost:8080/infer \
   -H "Content-Type: application/json" \
-  -d '{"id":"t1","prompt":"2+2=","max_tokens":5}' | python -m json.tool
+  -d '{"id":"t1","prompt":"2+2=","max_tokens":10}' | python -m json.tool
 
-# Profile
-docker compose run --rm python-worker python src/profile_inference.py \
-  --warmup 2 --steps 5 --max-tokens 50
+# Prometheus metrics
+curl http://localhost:8080/metrics
 
 # Kernel correctness tests
-docker compose run --rm python-worker python src/rope_kernel.py
+cd python-worker && conda run -n inference-engine python src/rope_kernel.py
 
 # Benchmark (A/B)
-python scripts/benchmark.py --requests 15 --max-tokens 50 --compare
+conda run -n inference-engine python scripts/benchmark.py --requests 15 --max-tokens 50 --compare
+```
+
+### Rebuild C++ sidecar (after source changes)
+```bash
+conda activate /data/vineel/conda-envs/inference-engine
+cd cpp-sidecar
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=/data/vineel/conda-envs/inference-engine
+cmake --build build --parallel $(nproc)
 ```
 
 ## Rules
 - Never change the IPC protocol or UDS server loop
 - C++ sidecar does not need GPU access
 - `transformers` pinned at `4.40.2` — do not upgrade without checking patch target still exists
+- `accelerate` pinned at `0.34.2` — accelerate 1.x breaks dispatch_model for bitsandbytes 4-bit models with transformers 4.40.2
 - Prefer editing existing files over creating new ones

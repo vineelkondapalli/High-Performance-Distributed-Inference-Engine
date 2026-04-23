@@ -1,5 +1,5 @@
-# CUDA 12.1 runtime — required for bitsandbytes INT4 and Triton kernels
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# CUDA 12.4 runtime — matches PyTorch 2.5.1+cu124 wheels and host driver 560 (CUDA 12.6)
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 # Python 3.11 + libgomp (required by PyTorch OpenMP threading)
 RUN apt-get update && apt-get install -y --no-install-recommends \

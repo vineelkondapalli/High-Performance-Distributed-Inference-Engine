@@ -29,6 +29,7 @@ import signal
 import socket
 import struct
 import sys
+import torch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,13 +65,15 @@ def send_message(conn: socket.socket, data: dict) -> None:
 
 def _recv_exact(conn: socket.socket, n: int) -> bytes:
     """Read exactly n bytes, raising on EOF."""
-    buf = b""
-    while len(buf) < n:
-        chunk = conn.recv(n - len(buf))
+    buf = bytearray(n)
+    view = memoryview(buf)
+    pos = 0
+    while pos < n:
+        chunk = conn.recv_into(view[pos:], n - pos)
         if not chunk:
             raise EOFError("Connection closed before all bytes received.")
-        buf += chunk
-    return buf
+        pos += chunk
+    return bytes(buf)
 
 
 # ── Triton RoPE patch helpers ─────────────────────────────────────────────────
@@ -191,7 +194,7 @@ def load_model():
     model = AutoModelForCausalLM.from_pretrained(
         HF_MODEL_ID,
         quantization_config=bnb_config,
-        device_map="auto",          # accelerate places layers on GPU automatically
+        device_map="auto",          # only one GPU visible inside container; auto picks cuda:0
         torch_dtype=torch.float16,
     )
     model.eval()
@@ -207,8 +210,6 @@ def load_model():
 
 def run_inference(llm, request: dict) -> dict:
     """Run a single inference request and return a response dict."""
-    import torch
-
     model, tokenizer = llm
     prompt     = request["prompt"]
     max_tokens = request.get("max_tokens", 128)
@@ -288,8 +289,8 @@ def run_server(llm) -> None:
                     request  = recv_message(conn)
                     response = run_inference(llm, request)
                     send_message(conn, response)
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("Error handling connection: %s", exc)
+                except Exception:  # noqa: BLE001
+                    log.exception("Error handling connection")
 
     # Clean up socket file on exit.
     if os.path.exists(SOCKET_PATH):

@@ -16,22 +16,23 @@ services:
     build:
       context: ./python-worker
       dockerfile: Dockerfile
-    runtime: nvidia                    # NVIDIA Container Toolkit GPU access
     volumes:
-      - socket-vol:/tmp                # shared UDS socket
-      - ./models:/models               # HF model cache needs write access
+      - socket-vol:/tmp                                    # shared UDS socket
+      - /mnt/data/shared/vineel/hf_cache:/models/hf_cache # HF model cache on shared storage
     environment:
-      SOCKET_PATH: /tmp/inference.sock
-      HF_MODEL_ID: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-      HF_HOME:     /models/hf_cache
-      N_CTX:       "2048"
-      TRITON_ROPE: "0"                 # set to "1" to enable fused Triton RoPE kernel
+      SOCKET_PATH:          /tmp/inference.sock
+      HF_MODEL_ID:          TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      HF_HOME:              /models/hf_cache
+      N_CTX:                "2048"
+      TRITON_ROPE:          "0"                 # set to "1" to enable fused Triton RoPE kernel
+      CUDA_VISIBLE_DEVICES: "0"                 # CDI passes only GPU 8 in as index 0
     deploy:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            - driver: cdi
+              device_ids:
+                - nvidia.com/gpu=8      # rootless Docker uses CDI instead of nvidia runtime
               capabilities: [gpu]
     restart: unless-stopped
     healthcheck:

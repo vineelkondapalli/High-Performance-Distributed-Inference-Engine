@@ -6,6 +6,13 @@ cpp-sidecar/build/
 *.o
 *.a
 
+# CUDA extension build artifacts
+*.so
+python-worker/src/cuda_kernels/build/
+
+# Nsight Compute profiles
+profiles/
+
 # Python
 __pycache__/
 *.pyc
